@@ -7,14 +7,14 @@ import (
 	"github.com/ipfs/go-bitswap/client/internal"
 	bsbpm "github.com/ipfs/go-bitswap/client/internal/blockpresencemanager"
 	bsgetter "github.com/ipfs/go-bitswap/client/internal/getter"
-	notifications "github.com/ipfs/go-bitswap/client/internal/notifications"
+	"github.com/ipfs/go-bitswap/client/internal/notifications"
 	bspm "github.com/ipfs/go-bitswap/client/internal/peermanager"
 	bssim "github.com/ipfs/go-bitswap/client/internal/sessioninterestmanager"
 	blocks "github.com/ipfs/go-block-format"
-	cid "github.com/ipfs/go-cid"
+	"github.com/ipfs/go-cid"
 	delay "github.com/ipfs/go-ipfs-delay"
 	logging "github.com/ipfs/go-log"
-	peer "github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"go.uber.org/zap"
 )
 
@@ -23,6 +23,7 @@ var sflog = log.Desugar()
 
 const (
 	broadcastLiveWantsLimit = 64
+	filteredBroadcastLimit  = 3
 )
 
 // PeerManager keeps track of which sessions are interested in which peers
@@ -41,6 +42,9 @@ type PeerManager interface {
 	BroadcastWantHaves(context.Context, []cid.Cid)
 	// SendCancels tells the PeerManager to send cancels to all peers
 	SendCancels(context.Context, []cid.Cid)
+	// FilteredBroadcast broadcasts want-haves to all peers if the block is not presented in the replication index,
+	// sends wants to peers that may have it otherwise; A want-block is sent to one of these peers, the others receive want-haves.
+	FilteredBroadcast(ctx context.Context, wants []cid.Cid)
 }
 
 // SessionManager manages all the sessions
@@ -130,6 +134,8 @@ type Session struct {
 	id    uint64
 
 	self peer.ID
+
+	filteredBroadcasts int
 }
 
 // New creates a new bitswap session whose lifetime is bounded by the
@@ -184,18 +190,19 @@ func (s *Session) Shutdown() {
 }
 
 // ReceiveFrom receives incoming blocks from the given peer.
-func (s *Session) ReceiveFrom(from peer.ID, ks []cid.Cid, haves []cid.Cid, dontHaves []cid.Cid) {
+func (s *Session) ReceiveFrom(from peer.ID, ks []cid.Cid, haves []cid.Cid, dontHaves []cid.Cid, knows []cid.Cid) {
 	// The SessionManager tells each Session about all keys that it may be
 	// interested in. Here the Session filters the keys to the ones that this
 	// particular Session is interested in.
-	interestedRes := s.sim.FilterSessionInterested(s.id, ks, haves, dontHaves)
+	interestedRes := s.sim.FilterSessionInterested(s.id, ks, haves, dontHaves, knows)
 	ks = interestedRes[0]
 	haves = interestedRes[1]
 	dontHaves = interestedRes[2]
-	s.logReceiveFrom(from, ks, haves, dontHaves)
+	knows = interestedRes[3]
+	s.logReceiveFrom(from, ks, haves, dontHaves, knows)
 
 	// Inform the session want sender that a message has been received
-	s.sws.Update(from, ks, haves, dontHaves)
+	s.sws.Update(from, ks, haves, dontHaves, knows)
 
 	if len(ks) == 0 {
 		return
@@ -208,20 +215,23 @@ func (s *Session) ReceiveFrom(from peer.ID, ks []cid.Cid, haves []cid.Cid, dontH
 	}
 }
 
-func (s *Session) logReceiveFrom(from peer.ID, interestedKs []cid.Cid, haves []cid.Cid, dontHaves []cid.Cid) {
+func (s *Session) logReceiveFrom(from peer.ID, interestedKs []cid.Cid, haves []cid.Cid, dontHaves []cid.Cid, knows []cid.Cid) {
 	// Save some CPU cycles if log level is higher than debug
 	if ce := sflog.Check(zap.DebugLevel, "Bitswap <- rcv message"); ce == nil {
 		return
 	}
 
 	for _, c := range interestedKs {
-		log.Debugw("Bitswap <- block", "local", s.self, "from", from, "cid", c, "session", s.id)
+		log.Debugw("Bitswap <- BLOCK", "local", s.self, "from", from, "cid", c, "session", s.id)
 	}
 	for _, c := range haves {
 		log.Debugw("Bitswap <- HAVE", "local", s.self, "from", from, "cid", c, "session", s.id)
 	}
 	for _, c := range dontHaves {
 		log.Debugw("Bitswap <- DONT_HAVE", "local", s.self, "from", from, "cid", c, "session", s.id)
+	}
+	for _, c := range knows {
+		log.Debugw("Bitswap <- KNOW", "local", s.self, "from", from, "cid", c, "session", s.id)
 	}
 }
 
@@ -236,6 +246,7 @@ func (s *Session) GetBlock(ctx context.Context, k cid.Cid) (blocks.Block, error)
 // returns a channel that found blocks will be returned on. No order is
 // guaranteed on the returned blocks.
 func (s *Session) GetBlocks(ctx context.Context, keys []cid.Cid) (<-chan blocks.Block, error) {
+	log.Infow("Session.GetBlocks", "session", s.id, "cids", keys)
 	ctx, span := internal.StartSpan(ctx, "Session.GetBlocks")
 	defer span.End()
 
@@ -347,8 +358,12 @@ func (s *Session) broadcast(ctx context.Context, wants []cid.Cid) {
 	// any blocks for a while) then broadcast all pending wants
 	if wants == nil {
 		wants = s.sw.PrepareBroadcast()
+		log.Infow("Idle tick - broadcasting", "session", s.id, "cids", wants, "pending", len(wants))
+	} else {
+		log.Infow("Dead session - broadcasting", "session", s.id, "cids", wants, "pending", len(wants))
 	}
 
+	// TODO should we do filtered broadcast there?
 	// Broadcast a want-have for the live wants to everyone we're connected to
 	s.broadcastWantHaves(ctx, wants)
 
@@ -358,7 +373,7 @@ func (s *Session) broadcast(ctx context.Context, wants []cid.Cid) {
 		// Search for providers who have the first want in the list.
 		// Typically if the provider has the first block they will have
 		// the rest of the blocks also.
-		log.Debugw("FindMorePeers", "session", s.id, "cid", wants[0], "pending", len(wants))
+		log.Infow("After broadcasting - finding more peers", "session", s.id, "cid", wants[0], "pending", len(wants))
 		s.findMorePeers(ctx, wants[0])
 	}
 	s.resetIdleTick()
@@ -377,12 +392,14 @@ func (s *Session) handlePeriodicSearch(ctx context.Context) {
 		return
 	}
 
+	log.Infow("Periodic search - broadcasting and finding more peers", "cid", randomWant)
+
 	// TODO: come up with a better strategy for determining when to search
 	// for new providers for blocks.
 	s.findMorePeers(ctx, randomWant)
 
+	// TODO should we do filtered broadcasting here?
 	s.broadcastWantHaves(ctx, []cid.Cid{randomWant})
-
 	s.periodicSearchTimer.Reset(s.periodicSearchDelay.NextWaitTime())
 }
 
@@ -393,7 +410,7 @@ func (s *Session) findMorePeers(ctx context.Context, c cid.Cid) {
 		for p := range s.providerFinder.FindProvidersAsync(ctx, k) {
 			// When a provider indicates that it has a cid, it's equivalent to
 			// the providing peer sending a HAVE
-			s.sws.Update(p, nil, []cid.Cid{c}, nil)
+			s.sws.Update(p, nil, []cid.Cid{c}, nil, nil)
 		}
 	}(c)
 }
@@ -458,14 +475,27 @@ func (s *Session) wantBlocks(ctx context.Context, newks []cid.Cid) {
 	ks := s.sw.GetNextWants()
 	if len(ks) > 0 {
 		log.Infow("No peers - broadcasting", "session", s.id, "want-count", len(ks))
-		s.broadcastWantHaves(ctx, ks)
+		// We call this broadcast that looks into the replication index to select the best peers first
+		s.filteredBroadcast(ctx, ks)
+		//s.broadcastWantHaves(ctx, ks)
 	}
 }
 
 // Send want-haves to all connected peers
 func (s *Session) broadcastWantHaves(ctx context.Context, wants []cid.Cid) {
-	log.Debugw("broadcastWantHaves", "session", s.id, "cids", wants)
 	s.pm.BroadcastWantHaves(ctx, wants)
+}
+
+func (s *Session) filteredBroadcast(ctx context.Context, wants []cid.Cid) {
+	// TODO this needs a locker?
+	if s.filteredBroadcasts > filteredBroadcastLimit {
+		s.filteredBroadcasts = 0
+		s.pm.BroadcastWantHaves(ctx, wants)
+		return
+	}
+
+	s.filteredBroadcasts++
+	s.pm.FilteredBroadcast(ctx, wants)
 }
 
 // The session will broadcast if it has outstanding wants and doesn't receive

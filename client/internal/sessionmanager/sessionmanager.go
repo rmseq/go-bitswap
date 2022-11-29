@@ -24,7 +24,7 @@ import (
 type Session interface {
 	exchange.Fetcher
 	ID() uint64
-	ReceiveFrom(peer.ID, []cid.Cid, []cid.Cid, []cid.Cid)
+	ReceiveFrom(peer.ID, []cid.Cid, []cid.Cid, []cid.Cid, []cid.Cid)
 	Shutdown()
 }
 
@@ -152,12 +152,12 @@ func (sm *SessionManager) GetNextSessionID() uint64 {
 }
 
 // ReceiveFrom is called when a new message is received
-func (sm *SessionManager) ReceiveFrom(ctx context.Context, p peer.ID, blks []cid.Cid, haves []cid.Cid, dontHaves []cid.Cid) {
+func (sm *SessionManager) ReceiveFrom(ctx context.Context, p peer.ID, blks []cid.Cid, haves []cid.Cid, dontHaves []cid.Cid, knows []cid.Cid) {
 	// Record block presence for HAVE / DONT_HAVE
-	sm.blockPresenceManager.ReceiveFrom(p, haves, dontHaves)
+	sm.blockPresenceManager.ReceiveFrom(p, haves, dontHaves, knows)
 
 	// Notify each session that is interested in the blocks / HAVEs / DONT_HAVEs
-	for _, id := range sm.sessionInterestManager.InterestedSessions(blks, haves, dontHaves) {
+	for _, id := range sm.sessionInterestManager.InterestedSessions(blks, haves, dontHaves, knows) {
 		sm.sessLk.RLock()
 		if sm.sessions == nil { // check if SessionManager was shutdown
 			sm.sessLk.RUnlock()
@@ -167,7 +167,7 @@ func (sm *SessionManager) ReceiveFrom(ctx context.Context, p peer.ID, blks []cid
 		sm.sessLk.RUnlock()
 
 		if ok {
-			sess.ReceiveFrom(p, blks, haves, dontHaves)
+			sess.ReceiveFrom(p, blks, haves, dontHaves, knows)
 		}
 	}
 

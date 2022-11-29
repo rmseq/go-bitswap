@@ -777,7 +777,7 @@ func checkOutput(t *testing.T, e *Engine, envelope *Envelope, expBlks []string, 
 	return nil
 }
 
-func checkPresence(presences []message.BlockPresence, expPresence []string, presenceType pb.Message_BlockPresenceType) error {
+func checkPresence(presences []message.BlockPresence, expPresence []string, presenceType pb.Message_PresenceType) error {
 	for _, k := range expPresence {
 		found := false
 		expected := blocks.NewBlock([]byte(k))

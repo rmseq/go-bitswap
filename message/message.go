@@ -9,12 +9,12 @@ import (
 	pb "github.com/ipfs/go-bitswap/message/pb"
 
 	blocks "github.com/ipfs/go-block-format"
-	cid "github.com/ipfs/go-cid"
+	"github.com/ipfs/go-cid"
 	pool "github.com/libp2p/go-buffer-pool"
-	msgio "github.com/libp2p/go-msgio"
+	"github.com/libp2p/go-msgio"
 
-	u "github.com/ipfs/go-ipfs-util"
 	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 // BitSwapMessage is the basic interface for interacting building, encoding,
@@ -59,11 +59,22 @@ type BitSwapMessage interface {
 	// AddBlock adds a block to the message
 	AddBlock(blocks.Block)
 	// AddBlockPresence adds a HAVE / DONT_HAVE for the given Cid to the message
-	AddBlockPresence(cid.Cid, pb.Message_BlockPresenceType)
+	AddBlockPresence(cid.Cid, pb.Message_PresenceType)
 	// AddHave adds a HAVE for the given Cid to the message
 	AddHave(cid.Cid)
 	// AddDontHave adds a DONT_HAVE for the given Cid to the message
 	AddDontHave(cid.Cid)
+
+	// Info returns the cids for each HAVE or DONT_HAVE respectively
+	Info() ([]cid.Cid, []cid.Cid)
+	// Knows returns a map containing the peer.IDs that have each cid
+	Knows() map[cid.Cid][]peer.ID
+
+	// AddInfo adds a HAVE or DONT_HAVE about a given block
+	AddInfo(cid.Cid, pb.Message_PresenceType)
+	// AddKnow adds a KNOW about a given block
+	AddKnow(cid.Cid, peer.ID)
+
 	// SetPendingBytes sets the number of bytes of data that are yet to be sent
 	// to the client (because they didn't fit in this message)
 	SetPendingBytes(int32)
@@ -81,9 +92,11 @@ type BitSwapMessage interface {
 // Exportable is an interface for structures than can be
 // encoded in a bitswap protobuf.
 type Exportable interface {
-	// Note that older Bitswap versions use a different wire format, so we need
-	// to convert the message to the appropriate format depending on which
-	// version of the protocol the remote peer supports.
+	/*
+		Note that older Bitswap versions use a different wire format, so we need
+		to convert the message to the appropriate format depending on which
+		version of the protocol the remote peer supports.
+	*/
 	ToProtoV0() *pb.Message
 	ToProtoV1() *pb.Message
 	ToNetV0(w io.Writer) error
@@ -93,7 +106,15 @@ type Exportable interface {
 // BlockPresence represents a HAVE / DONT_HAVE for a given Cid
 type BlockPresence struct {
 	Cid  cid.Cid
-	Type pb.Message_BlockPresenceType
+	Type pb.Message_PresenceType
+}
+
+// BlockInfo represents replication indexes which can be a HAVE, DONT_HAVE or KNOW for a given Cid,
+// each KNOW must have (at least) a peer.ID as source, HAVE/DONT_HAVE are used to actively replicate information
+type BlockInfo struct {
+	Cid    cid.Cid
+	Type   pb.Message_PresenceType
+	Source []peer.ID
 }
 
 // Entry is a wantlist entry in a Bitswap message, with flags indicating
@@ -106,24 +127,25 @@ type Entry struct {
 	SendDontHave bool
 }
 
-// Get the size of the entry on the wire
+// Size returns the size of the entry on the wire
 func (e *Entry) Size() int {
 	epb := e.ToPB()
 	return epb.Size()
 }
 
-// Get the entry in protobuf form
+// ToPB returns the entry in protobuf form
 func (e *Entry) ToPB() pb.Message_Wantlist_Entry {
 	return pb.Message_Wantlist_Entry{
 		Block:        pb.Cid{Cid: e.Cid},
-		Priority:     int32(e.Priority),
+		Priority:     e.Priority,
 		Cancel:       e.Cancel,
 		WantType:     e.WantType,
 		SendDontHave: e.SendDontHave,
 	}
 }
 
-var MaxEntrySize = maxEntrySize()
+// TODO unused
+/* var MaxEntrySize = maxEntrySize()
 
 func maxEntrySize() int {
 	var maxInt32 int32 = (1 << 31) - 1
@@ -140,13 +162,18 @@ func maxEntrySize() int {
 	}
 	return e.Size()
 }
+*/
 
 type impl struct {
 	full           bool
 	wantlist       map[cid.Cid]*Entry
 	blocks         map[cid.Cid]blocks.Block
-	blockPresences map[cid.Cid]pb.Message_BlockPresenceType
+	blockPresences map[cid.Cid]pb.Message_PresenceType
 	pendingBytes   int32
+
+	//TODO peer.ID probably should be stored as string because we are always converting it
+	knows map[cid.Cid][]peer.ID
+	info  map[cid.Cid]pb.Message_PresenceType
 }
 
 // New returns a new, empty bitswap message
@@ -159,7 +186,9 @@ func newMsg(full bool) *impl {
 		full:           full,
 		wantlist:       make(map[cid.Cid]*Entry),
 		blocks:         make(map[cid.Cid]blocks.Block),
-		blockPresences: make(map[cid.Cid]pb.Message_BlockPresenceType),
+		blockPresences: make(map[cid.Cid]pb.Message_PresenceType),
+		knows:          make(map[cid.Cid][]peer.ID),
+		info:           make(map[cid.Cid]pb.Message_PresenceType),
 	}
 }
 
@@ -174,6 +203,12 @@ func (m *impl) Clone() BitSwapMessage {
 	}
 	for k := range m.blockPresences {
 		msg.blockPresences[k] = m.blockPresences[k]
+	}
+	for k := range m.knows {
+		msg.knows[k] = m.knows[k]
+	}
+	for k := range m.info {
+		msg.info[k] = m.info[k]
 	}
 	msg.pendingBytes = m.pendingBytes
 	return msg
@@ -190,6 +225,12 @@ func (m *impl) Reset(full bool) {
 	}
 	for k := range m.blockPresences {
 		delete(m.blockPresences, k)
+	}
+	for k := range m.knows {
+		delete(m.knows, k)
+	}
+	for k := range m.info {
+		delete(m.info, k)
 	}
 	m.pendingBytes = 0
 }
@@ -239,8 +280,24 @@ func newMessageFromProto(pbm pb.Message) (BitSwapMessage, error) {
 		m.AddBlockPresence(bi.Cid.Cid, bi.Type)
 	}
 
-	m.pendingBytes = pbm.PendingBytes
+	for _, info := range pbm.GetBlocksInfo() {
+		if !info.Cid.Cid.Defined() {
+			return nil, errCidMissing
+		}
 
+		switch tp := info.Type; tp {
+		case pb.Message_Know:
+			for _, s := range info.GetSources() {
+				if p, err := peer.Decode(s); err == nil {
+					m.AddKnow(info.Cid.Cid, p)
+				}
+			}
+		case pb.Message_Have, pb.Message_DontHave:
+			m.AddInfo(info.Cid.Cid, tp)
+		}
+	}
+
+	m.pendingBytes = pbm.PendingBytes
 	return m, nil
 }
 
@@ -249,7 +306,8 @@ func (m *impl) Full() bool {
 }
 
 func (m *impl) Empty() bool {
-	return len(m.blocks) == 0 && len(m.wantlist) == 0 && len(m.blockPresences) == 0
+	return len(m.blocks) == 0 && len(m.wantlist) == 0 && len(m.blockPresences) == 0 &&
+		len(m.info) == 0 && len(m.knows) == 0
 }
 
 func (m *impl) Wantlist() []Entry {
@@ -284,7 +342,7 @@ func (m *impl) DontHaves() []cid.Cid {
 	return m.getBlockPresenceByType(pb.Message_DontHave)
 }
 
-func (m *impl) getBlockPresenceByType(t pb.Message_BlockPresenceType) []cid.Cid {
+func (m *impl) getBlockPresenceByType(t pb.Message_PresenceType) []cid.Cid {
 	cids := make([]cid.Cid, 0, len(m.blockPresences))
 	for c, bpt := range m.blockPresences {
 		if bpt == t {
@@ -356,7 +414,7 @@ func (m *impl) AddBlock(b blocks.Block) {
 	m.blocks[b.Cid()] = b
 }
 
-func (m *impl) AddBlockPresence(c cid.Cid, t pb.Message_BlockPresenceType) {
+func (m *impl) AddBlockPresence(c cid.Cid, t pb.Message_PresenceType) {
 	if _, ok := m.blocks[c]; ok {
 		return
 	}
@@ -381,6 +439,13 @@ func (m *impl) Size() int {
 	}
 	for _, e := range m.wantlist {
 		size += e.Size()
+
+	}
+	for c := range m.info {
+		size += BlockInfoSize(c, []peer.ID{})
+	}
+	for c, p := range m.knows {
+		size += BlockInfoSize(c, p)
 	}
 
 	return size
@@ -393,27 +458,35 @@ func BlockPresenceSize(c cid.Cid) int {
 	}).Size()
 }
 
+func BlockInfoSize(c cid.Cid, peers []peer.ID) int {
+	return (&pb.Message_BlockInfo{
+		Cid:     pb.Cid{Cid: c},
+		Type:    pb.Message_Have,
+		Sources: encode(peers), // peers may be empty
+	}).Size()
+}
+
 // FromNet generates a new BitswapMessage from incoming data on an io.Reader.
 func FromNet(r io.Reader) (BitSwapMessage, error) {
 	reader := msgio.NewVarintReaderSize(r, network.MessageSizeMax)
 	return FromMsgReader(reader)
 }
 
-// FromPBReader generates a new Bitswap message from a gogo-protobuf reader
+// FromMsgReader generates a new Bitswap message from a gogo-protobuf reader
 func FromMsgReader(r msgio.Reader) (BitSwapMessage, error) {
 	msg, err := r.ReadMsg()
 	if err != nil {
 		return nil, err
 	}
 
-	var pb pb.Message
-	err = pb.Unmarshal(msg)
+	var pbm pb.Message
+	err = pbm.Unmarshal(msg)
 	r.ReleaseMsg(msg)
 	if err != nil {
 		return nil, err
 	}
 
-	return newMessageFromProto(pb)
+	return newMessageFromProto(pbm)
 }
 
 func (m *impl) ToProtoV0() *pb.Message {
@@ -424,9 +497,9 @@ func (m *impl) ToProtoV0() *pb.Message {
 	}
 	pbm.Wantlist.Full = m.full
 
-	blocks := m.Blocks()
-	pbm.Blocks = make([][]byte, 0, len(blocks))
-	for _, b := range blocks {
+	blks := m.Blocks()
+	pbm.Blocks = make([][]byte, 0, len(blks))
+	for _, b := range blks {
 		pbm.Blocks = append(pbm.Blocks, b.RawData())
 	}
 	return pbm
@@ -440,9 +513,9 @@ func (m *impl) ToProtoV1() *pb.Message {
 	}
 	pbm.Wantlist.Full = m.full
 
-	blocks := m.Blocks()
-	pbm.Payload = make([]pb.Message_Block, 0, len(blocks))
-	for _, b := range blocks {
+	blks := m.Blocks()
+	pbm.Payload = make([]pb.Message_Block, 0, len(blks))
+	for _, b := range blks {
 		pbm.Payload = append(pbm.Payload, pb.Message_Block{
 			Data:   b.RawData(),
 			Prefix: b.Cid().Prefix().Bytes(),
@@ -457,8 +530,23 @@ func (m *impl) ToProtoV1() *pb.Message {
 		})
 	}
 
-	pbm.PendingBytes = m.PendingBytes()
+	// TODO should we create toProtoV3 instead?
+	pbm.BlocksInfo = make([]*pb.Message_BlockInfo, 0, len(m.info)+len(m.knows))
+	for c, s := range m.knows {
+		pbm.BlocksInfo = append(pbm.BlocksInfo, &pb.Message_BlockInfo{
+			Cid:     pb.Cid{Cid: c},
+			Type:    pb.Message_Know,
+			Sources: encode(s),
+		})
+	}
+	for c, t := range m.info {
+		pbm.BlocksInfo = append(pbm.BlocksInfo, &pb.Message_BlockInfo{
+			Cid:  pb.Cid{Cid: c},
+			Type: t,
+		})
+	}
 
+	pbm.PendingBytes = m.PendingBytes()
 	return pbm
 }
 
@@ -489,12 +577,46 @@ func write(w io.Writer, m *pb.Message) error {
 }
 
 func (m *impl) Loggable() map[string]interface{} {
-	blocks := make([]string, 0, len(m.blocks))
+	blks := make([]string, 0, len(m.blocks))
 	for _, v := range m.blocks {
-		blocks = append(blocks, v.Cid().String())
+		blks = append(blks, v.Cid().String())
 	}
 	return map[string]interface{}{
-		"blocks": blocks,
+		"blocks": blks,
 		"wants":  m.Wantlist(),
 	}
+	// TODO replication is not added here because, should it? what are the side effects?
+}
+
+func (m *impl) AddInfo(c cid.Cid, tp pb.Message_PresenceType) {
+	m.info[c] = tp
+}
+
+func (m *impl) AddKnow(c cid.Cid, p peer.ID) {
+	m.knows[c] = append(m.knows[c], p)
+}
+
+func (m *impl) Info() ([]cid.Cid, []cid.Cid) {
+	haves, donts := make([]cid.Cid, 0, len(m.info)), make([]cid.Cid, 0, len(m.info))
+	for c, tp := range m.info {
+		switch tp {
+		case pb.Message_Have:
+			haves = append(haves, c)
+		case pb.Message_DontHave:
+			donts = append(donts, c)
+		}
+	}
+	return haves, donts
+}
+
+func (m *impl) Knows() map[cid.Cid][]peer.ID {
+	return m.knows
+}
+
+func encode(peers []peer.ID) []string {
+	encoded := make([]string, len(peers))
+	for _, p := range peers {
+		encoded = append(encoded, p.String())
+	}
+	return encoded
 }

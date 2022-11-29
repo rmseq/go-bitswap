@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/ipfs/go-bitswap/client/replication/storage"
 	"sort"
 	"sync"
 	"time"
@@ -138,6 +139,14 @@ func ProvideEnabled(enabled bool) Option {
 
 func WithPeerBlockRequestFilter(pbrf decision.PeerBlockRequestFilter) Option {
 	o := decision.WithPeerBlockRequestFilter(pbrf)
+	return func(bs *Server) {
+		bs.engineOptions = append(bs.engineOptions, o)
+	}
+}
+
+// WithReplication enables replication based responses (knows) to wants.
+func WithReplication(info *storage.Index) Option {
+	o := decision.WithReplication(info)
 	return func(bs *Server) {
 		bs.engineOptions = append(bs.engineOptions, o)
 	}

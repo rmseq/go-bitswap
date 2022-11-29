@@ -2,6 +2,7 @@ package messagequeue
 
 import (
 	"context"
+	"github.com/ipfs/go-bitswap/tracer"
 	"math"
 	"sync"
 	"time"
@@ -11,11 +12,10 @@ import (
 	bsmsg "github.com/ipfs/go-bitswap/message"
 	pb "github.com/ipfs/go-bitswap/message/pb"
 	bsnet "github.com/ipfs/go-bitswap/network"
-	cid "github.com/ipfs/go-cid"
+	"github.com/ipfs/go-cid"
 	logging "github.com/ipfs/go-log"
-	peer "github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
-	"go.uber.org/zap"
 )
 
 var log = logging.Logger("bitswap")
@@ -103,6 +103,12 @@ type MessageQueue struct {
 
 	// Used to track things that happen asynchronously -- used only in test
 	events chan messageEvent
+
+	// Used to share replication info though a broadcast, these slices are filled with
+	// HAVES and DONT-HAVES and should be cleared when they are sent.
+	infoLocker       sync.Mutex
+	pendingInfoHaves []cid.Cid
+	pendingInfoDonts []cid.Cid
 }
 
 // recallWantlist keeps a list of pending wants and a list of sent wants
@@ -359,6 +365,27 @@ func (mq *MessageQueue) AddCancels(cancelKs []cid.Cid) {
 	}
 }
 
+// AddInfo adds replication info to the queue
+func (mq *MessageQueue) AddInfo(haves, donts []cid.Cid) {
+	if len(haves) == 0 && len(donts) == 0 {
+		return
+	}
+
+	mq.infoLocker.Lock()
+	defer mq.infoLocker.Unlock()
+
+	for _, c := range haves {
+		mq.pendingInfoHaves = append(mq.pendingInfoHaves, c)
+	}
+	for _, c := range donts {
+		mq.pendingInfoDonts = append(mq.pendingInfoDonts, c)
+	}
+
+	// TODO Since this is not a priority, we probably can delay it a bit...
+	// Schedule a message send
+	mq.signalWorkReady()
+}
+
 // ResponseReceived is called when a message is received from the network.
 // ks is the set of blocks, HAVEs and DONT_HAVEs in the message
 // Note that this is just used to calculate latency.
@@ -439,8 +466,7 @@ func (mq *MessageQueue) runQueue() {
 
 			// If we have too many updates and/or we've waited too
 			// long, send immediately.
-			if mq.pendingWorkCount() > sendMessageCutoff ||
-				mq.clock.Since(workScheduled) >= sendMessageMaxDelay {
+			if mq.pendingWorkCount() > sendMessageCutoff || mq.clock.Since(workScheduled) >= sendMessageMaxDelay {
 				mq.sendIfReady()
 				workScheduled = time.Time{}
 			} else {
@@ -534,9 +560,6 @@ func (mq *MessageQueue) sendMessage() {
 		return
 	}
 
-	wantlist := message.Wantlist()
-	mq.logOutgoingMessage(wantlist)
-
 	if err := sender.SendMsg(mq.ctx, message); err != nil {
 		// If the message couldn't be sent, the networking layer will
 		// emit a Disconnect event and the MessageQueue will get cleaned up
@@ -545,11 +568,13 @@ func (mq *MessageQueue) sendMessage() {
 		return
 	}
 
+	tracer.LogMessage("Sent (messagequeue)", mq.p, message)
+
 	// Record sent time so as to calculate message latency
 	onSent()
 
 	// Set a timer to wait for responses
-	mq.simulateDontHaveWithTimeout(wantlist)
+	mq.simulateDontHaveWithTimeout(message.Wantlist())
 
 	// If the message was too big and only a subset of wants could be
 	// sent, schedule sending the rest of the wants in the next
@@ -634,50 +659,6 @@ func (mq *MessageQueue) handleResponse(ks []cid.Cid) {
 	}
 }
 
-func (mq *MessageQueue) logOutgoingMessage(wantlist []bsmsg.Entry) {
-	// Save some CPU cycles and allocations if log level is higher than debug
-	if ce := sflog.Check(zap.DebugLevel, "sent message"); ce == nil {
-		return
-	}
-
-	self := mq.network.Self()
-	for _, e := range wantlist {
-		if e.Cancel {
-			if e.WantType == pb.Message_Wantlist_Have {
-				log.Debugw("sent message",
-					"type", "CANCEL_WANT_HAVE",
-					"cid", e.Cid,
-					"local", self,
-					"to", mq.p,
-				)
-			} else {
-				log.Debugw("sent message",
-					"type", "CANCEL_WANT_BLOCK",
-					"cid", e.Cid,
-					"local", self,
-					"to", mq.p,
-				)
-			}
-		} else {
-			if e.WantType == pb.Message_Wantlist_Have {
-				log.Debugw("sent message",
-					"type", "WANT_HAVE",
-					"cid", e.Cid,
-					"local", self,
-					"to", mq.p,
-				)
-			} else {
-				log.Debugw("sent message",
-					"type", "WANT_BLOCK",
-					"cid", e.Cid,
-					"local", self,
-					"to", mq.p,
-				)
-			}
-		}
-	}
-}
-
 // Whether there is work to be processed
 func (mq *MessageQueue) hasPendingWork() bool {
 	return mq.pendingWorkCount() > 0
@@ -688,7 +669,10 @@ func (mq *MessageQueue) pendingWorkCount() int {
 	mq.wllock.Lock()
 	defer mq.wllock.Unlock()
 
-	return mq.bcstWants.pending.Len() + mq.peerWants.pending.Len() + mq.cancels.Len()
+	mq.infoLocker.Lock()
+	defer mq.infoLocker.Unlock()
+
+	return mq.bcstWants.pending.Len() + mq.peerWants.pending.Len() + mq.cancels.Len() + len(mq.pendingInfoDonts) + len(mq.pendingInfoHaves)
 }
 
 // Convert the lists of wants into a Bitswap message
@@ -768,6 +752,20 @@ func (mq *MessageQueue) extractOutgoingMessage(supportsHave bool) (bsmsg.BitSwap
 			goto FINISH
 		}
 	}
+
+	// TODO The msg size isn't checked which is probably problematic, fix it
+	// Finally, we want to add replication info.
+	mq.infoLocker.Lock()
+	for _, c := range mq.pendingInfoHaves {
+		mq.msg.AddInfo(c, pb.Message_Have)
+	}
+	mq.pendingInfoHaves = []cid.Cid{}
+
+	for _, c := range mq.pendingInfoDonts {
+		mq.msg.AddInfo(c, pb.Message_DontHave)
+	}
+	mq.pendingInfoDonts = []cid.Cid{}
+	mq.infoLocker.Unlock()
 
 FINISH:
 

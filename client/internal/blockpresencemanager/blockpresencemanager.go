@@ -8,21 +8,23 @@ import (
 )
 
 // BlockPresenceManager keeps track of which peers have indicated that they
-// have or explicitly don't have a block
+// have or explicitly don't have a block and if the peers have indicated that knows the block
 type BlockPresenceManager struct {
 	sync.RWMutex
-	presence map[cid.Cid]map[peer.ID]bool
+	presence  map[cid.Cid]map[peer.ID]bool
+	knowledge map[cid.Cid]map[peer.ID]bool
 }
 
 func New() *BlockPresenceManager {
 	return &BlockPresenceManager{
-		presence: make(map[cid.Cid]map[peer.ID]bool),
+		presence:  make(map[cid.Cid]map[peer.ID]bool),
+		knowledge: make(map[cid.Cid]map[peer.ID]bool),
 	}
 }
 
 // ReceiveFrom is called when a peer sends us information about which blocks
 // it has and does not have
-func (bpm *BlockPresenceManager) ReceiveFrom(p peer.ID, haves []cid.Cid, dontHaves []cid.Cid) {
+func (bpm *BlockPresenceManager) ReceiveFrom(p peer.ID, haves []cid.Cid, dontHaves []cid.Cid, knows []cid.Cid) {
 	bpm.Lock()
 	defer bpm.Unlock()
 
@@ -31,6 +33,13 @@ func (bpm *BlockPresenceManager) ReceiveFrom(p peer.ID, haves []cid.Cid, dontHav
 	}
 	for _, c := range dontHaves {
 		bpm.updateBlockPresence(p, c, false)
+	}
+
+	for _, c := range knows {
+		if _, ok := bpm.knowledge[c]; !ok {
+			bpm.knowledge[c] = make(map[peer.ID]bool)
+		}
+		bpm.knowledge[c][p] = true
 	}
 }
 
@@ -46,6 +55,13 @@ func (bpm *BlockPresenceManager) updateBlockPresence(p peer.ID, c cid.Cid, prese
 		return
 	}
 	bpm.presence[c][p] = present
+}
+
+func (bpm *BlockPresenceManager) PeerKnows(p peer.ID, c cid.Cid) bool {
+	bpm.RLock()
+	defer bpm.RUnlock()
+
+	return bpm.knowledge[c][p]
 }
 
 // PeerHasBlock indicates whether the given peer has sent a HAVE for the given
@@ -100,13 +116,14 @@ func (bpm *BlockPresenceManager) allDontHave(peers []peer.ID, c cid.Cid) bool {
 	return true
 }
 
-// RemoveKeys cleans up the given keys from the block presence map
+// RemoveKeys cleans up the given keys from the block presence map and the knowledge map
 func (bpm *BlockPresenceManager) RemoveKeys(ks []cid.Cid) {
 	bpm.Lock()
 	defer bpm.Unlock()
 
 	for _, c := range ks {
 		delete(bpm.presence, c)
+		delete(bpm.knowledge, c)
 	}
 }
 

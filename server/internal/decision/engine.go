@@ -4,6 +4,7 @@ package decision
 import (
 	"context"
 	"fmt"
+	"github.com/ipfs/go-bitswap/client/replication/storage"
 	"sync"
 	"time"
 
@@ -98,16 +99,16 @@ type PeerTagger interface {
 	UntagPeer(p peer.ID, tag string)
 }
 
-// Assigns a specific score to a peer
+// ScorePeerFunc assigns a specific score to a peer
 type ScorePeerFunc func(peer.ID, int)
 
 // ScoreLedger is an external ledger dealing with peer scores.
 type ScoreLedger interface {
-	// Returns aggregated data communication with a given peer.
+	// GetReceipt returns aggregated data communication with a given peer.
 	GetReceipt(p peer.ID) *Receipt
-	// Increments the sent counter for the given peer.
+	// AddToSentBytes increments the sent counter for the given peer.
 	AddToSentBytes(p peer.ID, n int)
-	// Increments the received counter for the given peer.
+	// AddToReceivedBytes increments the received counter for the given peer.
 	AddToReceivedBytes(p peer.ID, n int)
 	// PeerConnected should be called when a new peer connects,
 	// meaning the ledger should open accounting.
@@ -115,9 +116,9 @@ type ScoreLedger interface {
 	// PeerDisconnected should be called when a peer disconnects to
 	// clean up the accounting.
 	PeerDisconnected(p peer.ID)
-	// Starts the ledger sampling process.
+	// Start starts the ledger sampling process.
 	Start(scorePeer ScorePeerFunc)
-	// Stops the sampling process.
+	// Stop stops the sampling process.
 	Stop()
 }
 
@@ -187,6 +188,10 @@ type Engine struct {
 
 	bstoreWorkerCount          int
 	maxOutstandingBytesPerPeer int
+
+	// Used for replication, tldr: instead of sending a dont-have, the engine asks replicationIndex (replication indexes manager)
+	//if it knows the block; if it does, a response containing the peers that have that block (know message) is sent
+	replicationIndex *storage.Index
 }
 
 // TaskInfo represents the details of a request from a peer.
@@ -273,6 +278,12 @@ func WithMaxOutstandingBytesPerPeer(count int) Option {
 func WithSetSendDontHave(send bool) Option {
 	return func(e *Engine) {
 		e.sendDontHaves = send
+	}
+}
+
+func WithReplication(i *storage.Index) Option {
+	return func(e *Engine) {
+		e.replicationIndex = i
 	}
 }
 
@@ -424,7 +435,7 @@ func (e *Engine) startBlockstoreManager(px process.Process) {
 	})
 }
 
-// Start up workers to handle requests from other nodes for the data on this node
+// StartWorkers starts up workers to handle requests from other nodes for the data on this node
 func (e *Engine) StartWorkers(ctx context.Context, px process.Process) {
 	e.startBlockstoreManager(px)
 	e.startScoreLedger(px)
@@ -537,6 +548,7 @@ func (e *Engine) nextEnvelope(ctx context.Context) (*Envelope, error) {
 		for _, t := range nextTasks {
 			c := t.Topic.(cid.Cid)
 			td := t.Data.(*taskData)
+
 			if td.HaveBlock {
 				if td.IsWantBlock {
 					blockCids = append(blockCids, c)
@@ -544,6 +556,12 @@ func (e *Engine) nextEnvelope(ctx context.Context) (*Envelope, error) {
 				} else {
 					// Add HAVES to the message
 					msg.AddHave(c)
+				}
+			} else if td.KnowBlock {
+				// Replies with peers that KNOW the block
+				_, peers := e.replicationIndex.Have(c)
+				for _, p := range peers {
+					msg.AddKnow(c, p)
 				}
 			} else {
 				// Add DONT_HAVEs to the message
@@ -713,6 +731,20 @@ func (e *Engine) MessageReceived(ctx context.Context, p peer.ID, m bsmsg.BitSwap
 		}
 	}
 
+	// Know block operation
+	sendKnow := func(entry bsmsg.Entry, peers []peer.ID) {
+		newWorkExists = true
+		activeEntries = append(activeEntries, peertask.Task{
+			Topic:    entry.Cid,
+			Priority: int(entry.Priority),
+			Work:     bsmsg.BlockInfoSize(entry.Cid, peers),
+			Data: &taskData{
+				HaveBlock: false,
+				KnowBlock: true,
+			},
+		})
+	}
+
 	// Deny access to blocks
 	for _, entry := range denials {
 		log.Debugw("Bitswap engine: block denied access", "local", e.self, "from", p, "cid", entry.Cid, "sendDontHave", entry.SendDontHave)
@@ -730,7 +762,18 @@ func (e *Engine) MessageReceived(ctx context.Context, p peer.ID, m bsmsg.BitSwap
 		// If the block was not found
 		if !found {
 			log.Debugw("Bitswap engine: block not found", "local", e.self, "from", p, "cid", entry.Cid, "sendDontHave", entry.SendDontHave)
-			sendDontHave(entry)
+			// If replication is turned on, search Index to find who have the block
+			var have = false
+			var peers []peer.ID
+			if e.replicationIndex != nil {
+				have, peers = e.replicationIndex.Have(entry.Cid)
+			}
+			if have {
+				sendKnow(entry, peers)
+			} else {
+				sendDontHave(entry)
+			}
+
 		} else {
 			// The block was found, add it to the queue
 			newWorkExists = true
@@ -742,7 +785,7 @@ func (e *Engine) MessageReceived(ctx context.Context, p peer.ID, m bsmsg.BitSwap
 			// entrySize is the amount of space the entry takes up in the
 			// message we send to the recipient. If we're sending a block, the
 			// entrySize is the size of the block. Otherwise it's the size of
-			// a block presence entry.
+			// a block presences entry.
 			entrySize := blockSize
 			if !isWantBlock {
 				entrySize = bsmsg.BlockPresenceSize(c)
@@ -893,10 +936,10 @@ func (e *Engine) NotifyNewBlocks(blks []blocks.Block) {
 	// could have re-connected in the meantime.
 	if len(missingWants) > 0 {
 		e.lock.Lock()
-		for p, wl := range missingWants {
+		for p, wantlist := range missingWants {
 			if ledger, ok := e.ledgerMap[p]; ok {
 				ledger.lk.RLock()
-				for _, k := range wl {
+				for _, k := range wantlist {
 					if _, has := ledger.WantListContains(k); has {
 						continue
 					}
@@ -904,7 +947,7 @@ func (e *Engine) NotifyNewBlocks(blks []blocks.Block) {
 				}
 				ledger.lk.RUnlock()
 			} else {
-				for _, k := range wl {
+				for _, k := range wantlist {
 					e.peerLedger.CancelWant(p, k)
 				}
 			}

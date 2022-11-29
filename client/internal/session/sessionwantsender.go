@@ -2,11 +2,10 @@ package session
 
 import (
 	"context"
-
 	bsbpm "github.com/ipfs/go-bitswap/client/internal/blockpresencemanager"
 
-	cid "github.com/ipfs/go-cid"
-	peer "github.com/libp2p/go-libp2p/core/peer"
+	"github.com/ipfs/go-cid"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 const (
@@ -27,6 +26,7 @@ type BlockPresence int
 const (
 	BPDontHave BlockPresence = iota
 	BPUnknown
+	BPKnow
 	BPHave
 )
 
@@ -46,6 +46,8 @@ type update struct {
 	haves []cid.Cid
 	// DONT_HAVE message
 	dontHaves []cid.Cid
+	// KNOW message
+	knows []cid.Cid
 }
 
 // peerAvailability indicates a peer's connection state
@@ -158,14 +160,14 @@ func (sws *sessionWantSender) Cancel(ks []cid.Cid) {
 
 // Update is called when the session receives a message with incoming blocks
 // or HAVE / DONT_HAVE
-func (sws *sessionWantSender) Update(from peer.ID, ks []cid.Cid, haves []cid.Cid, dontHaves []cid.Cid) {
-	hasUpdate := len(ks) > 0 || len(haves) > 0 || len(dontHaves) > 0
+func (sws *sessionWantSender) Update(from peer.ID, blocks []cid.Cid, haves []cid.Cid, dontHaves []cid.Cid, knows []cid.Cid) {
+	hasUpdate := len(blocks) > 0 || len(haves) > 0 || len(dontHaves) > 0 || len(knows) > 0
 	if !hasUpdate {
 		return
 	}
 
 	sws.addChange(change{
-		update: update{from, ks, haves, dontHaves},
+		update: update{from, blocks, haves, dontHaves, knows},
 	})
 }
 
@@ -266,9 +268,11 @@ func (sws *sessionWantSender) onChange(changes []change) {
 
 		// Consolidate updates and changes to availability
 		if chng.update.from != "" {
-			// If the update includes blocks or haves, treat it as signaling that
+			//TODO knows must be considered?
+
+			// If the update includes blocks, haves or knows, treat it as signaling that
 			// the peer is available
-			if len(chng.update.ks) > 0 || len(chng.update.haves) > 0 {
+			if len(chng.update.ks) > 0 || len(chng.update.haves) > 0 || len(chng.update.knows) > 0 {
 				p := chng.update.from
 				availability[p] = true
 
@@ -437,13 +441,29 @@ func (sws *sessionWantSender) processUpdates(updates []update) []cid.Cid {
 		}
 	}
 
-	// If any peers have sent us too many consecutive DONT_HAVEs, remove them
-	// from the session
+	// Process KNOWs, this exists to ensure that peers which send knows are not unfairly kicked of the session
+	// but it also guarantees that knows are considered when picking the best peer (a peer that knows
+	// something about a block is better than one which dont-have).
+	for _, upd := range updates {
+		for _, c := range upd.knows {
+			// If we haven't already received a block for the want
+			if !blkCids.Has(c) {
+				// Update the block presence for the peer
+				sws.updateWantBlockPresence(c, upd.from)
+			}
+
+			// Clear the consecutive DONT_HAVE count for the peer
+			delete(sws.peerConsecutiveDontHaves, upd.from)
+			delete(prunePeers, upd.from)
+		}
+	}
+
+	// If any peers have sent us too many consecutive DONT_HAVEs, remove them from the session
 	for p := range prunePeers {
 		// Before removing the peer from the session, check if the peer
-		// sent us a HAVE for a block that we want
+		// sent us a HAVE or a KNOW for a block that we want
 		for c := range sws.wants {
-			if sws.bpm.PeerHasBlock(p, c) {
+			if sws.bpm.PeerHasBlock(p, c) || sws.bpm.PeerKnows(p, c) {
 				delete(prunePeers, p)
 				break
 			}
@@ -493,6 +513,7 @@ func (sws *sessionWantSender) checkForExhaustedWants(dontHaves []cid.Cid, newlyU
 
 	// If all available peers for a cid sent a DONT_HAVE, signal to the session
 	// that we've exhausted available peers
+	// TODO maybe add some sort of KNOW check here too
 	if len(wants) > 0 {
 		exhausted := sws.bpm.AllPeersDoNotHaveBlock(sws.spm.Peers(), wants)
 		sws.processExhaustedWants(exhausted)
@@ -505,6 +526,7 @@ func (sws *sessionWantSender) processExhaustedWants(exhausted []cid.Cid) {
 	newlyExhausted := sws.newlyExhausted(exhausted)
 	if len(newlyExhausted) > 0 {
 		sws.onPeersExhausted(newlyExhausted)
+		log.Infow("Peers exhausted", "cids", newlyExhausted)
 	}
 }
 
@@ -651,12 +673,14 @@ func (sws *sessionWantSender) updateWantBlockPresence(c cid.Cid, p peer.ID) {
 		return
 	}
 
-	// If the peer sent us a HAVE or DONT_HAVE for the cid, adjust the
+	// If the peer sent us a HAVE, DONT_HAVE or a KNOW for the cid, adjust the
 	// block presence for the peer / cid combination
 	if sws.bpm.PeerHasBlock(p, c) {
 		wi.setPeerBlockPresence(p, BPHave)
 	} else if sws.bpm.PeerDoesNotHaveBlock(p, c) {
 		wi.setPeerBlockPresence(p, BPDontHave)
+	} else if sws.bpm.PeerKnows(p, c) {
+		wi.setPeerBlockPresence(p, BPKnow)
 	} else {
 		wi.setPeerBlockPresence(p, BPUnknown)
 	}

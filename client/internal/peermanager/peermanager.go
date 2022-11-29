@@ -2,13 +2,14 @@ package peermanager
 
 import (
 	"context"
+	"github.com/ipfs/go-bitswap/client/replication/storage"
 	"sync"
 
 	logging "github.com/ipfs/go-log"
 	"github.com/ipfs/go-metrics-interface"
 
-	cid "github.com/ipfs/go-cid"
-	peer "github.com/libp2p/go-libp2p/core/peer"
+	"github.com/ipfs/go-cid"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 var log = logging.Logger("bs:peermgr")
@@ -21,6 +22,7 @@ type PeerQueue interface {
 	ResponseReceived(ks []cid.Cid)
 	Startup()
 	Shutdown()
+	AddInfo([]cid.Cid, []cid.Cid)
 }
 
 type Session interface {
@@ -46,11 +48,13 @@ type PeerManager struct {
 	sessions     map[uint64]Session
 	peerSessions map[peer.ID]map[uint64]struct{}
 
+	replicationIndex *storage.Index
+
 	self peer.ID
 }
 
 // New creates a new PeerManager, given a context and a peerQueueFactory.
-func New(ctx context.Context, createPeerQueue PeerQueueFactory, self peer.ID) *PeerManager {
+func New(ctx context.Context, createPeerQueue PeerQueueFactory, self peer.ID, replicationIndex *storage.Index) *PeerManager {
 	wantGauge := metrics.NewCtx(ctx, "wantlist_total", "Number of items in wantlist.").Gauge()
 	wantBlockGauge := metrics.NewCtx(ctx, "want_blocks_total", "Number of want-blocks in wantlist.").Gauge()
 	return &PeerManager{
@@ -60,8 +64,9 @@ func New(ctx context.Context, createPeerQueue PeerQueueFactory, self peer.ID) *P
 		ctx:             ctx,
 		self:            self,
 
-		sessions:     make(map[uint64]Session),
-		peerSessions: make(map[peer.ID]map[uint64]struct{}),
+		sessions:         make(map[uint64]Session),
+		peerSessions:     make(map[peer.ID]map[uint64]struct{}),
+		replicationIndex: replicationIndex,
 	}
 }
 
@@ -80,6 +85,14 @@ func (pm *PeerManager) ConnectedPeers() []peer.ID {
 		peers = append(peers, p)
 	}
 	return peers
+}
+
+func (pm *PeerManager) IsConnected(p peer.ID) bool {
+	pm.pqLk.RLock()
+	defer pm.pqLk.RUnlock()
+
+	_, ok := pm.peerQueues[p]
+	return ok
 }
 
 // Connected is called to add a new peer to the pool, and send it an initial set
@@ -139,6 +152,56 @@ func (pm *PeerManager) BroadcastWantHaves(ctx context.Context, wantHaves []cid.C
 	defer pm.pqLk.Unlock()
 
 	pm.pwm.broadcastWantHaves(wantHaves)
+}
+
+// FilteredBroadcast broadcasts want-haves to all peers if the block is not presented in the replication replicationIndex,
+// sends wants to peers that may have it otherwise; A want-block is sent to one of these peers, the others receive want-haves.
+func (pm *PeerManager) FilteredBroadcast(ctx context.Context, wants []cid.Cid) {
+	// No replication
+	if pm.replicationIndex == nil {
+		pm.BroadcastWantHaves(ctx, wants)
+		return
+	}
+
+	haves := make(map[peer.ID][]cid.Cid)
+	blocks := make(map[peer.ID][]cid.Cid)
+	leftovers := make([]cid.Cid, 0, len(wants))
+	for _, c := range wants {
+
+		// See if some connected peer has the block before broadcasting,
+		// replicationIndex.Have() only returns information about connected peers
+		_, peers := pm.replicationIndex.Have(c)
+
+		// TODO A viable min should be defined here since if only peer has the block may not be
+		// 		the best strategy only include him in a new session
+		if len(peers) < 3 {
+			leftovers = append(leftovers, c)
+			continue
+		}
+
+		// The first peer will receive a want-block
+		blocks[peers[0]] = append(blocks[peers[0]], c)
+		for _, p := range peers[1:] {
+			haves[p] = append(haves[p], c)
+		}
+	}
+
+	for p, c := range haves {
+		// If a peer has pending want-haves, want-blocks are also sent in this call
+		pm.SendWants(ctx, p, blocks[p], c)
+		delete(blocks, p)
+	}
+
+	// A peer may only have pending want-blocks so this has to be performed anyway
+	for p, c := range blocks {
+		pm.SendWants(ctx, p, c, []cid.Cid{})
+	}
+
+	log.Infow("FilteredBroadcast", "cids", wants, "leftovers", leftovers)
+	pm.pqLk.Lock()
+	defer pm.pqLk.Unlock()
+	pm.pwm.broadcastWantHaves(leftovers)
+
 }
 
 // SendWants sends the given want-blocks and want-haves to the given peer.
@@ -242,5 +305,23 @@ func (pm *PeerManager) signalAvailability(p peer.ID, isConnected bool) {
 		if s, ok := pm.sessions[sesId]; ok {
 			s.SignalAvailability(p, isConnected)
 		}
+	}
+}
+
+func (pm *PeerManager) BroadcastInfo(haves, donts []cid.Cid) {
+	pm.pqLk.Lock()
+	defer pm.pqLk.Unlock()
+
+	for _, pq := range pm.peerQueues {
+		pq.AddInfo(haves, donts)
+	}
+}
+
+func (pm *PeerManager) SendInfo(p peer.ID, haves, donts []cid.Cid) {
+	pm.pqLk.Lock()
+	defer pm.pqLk.Unlock()
+
+	if pq, ok := pm.peerQueues[p]; ok {
+		pq.AddInfo(haves, donts)
 	}
 }

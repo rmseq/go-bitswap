@@ -14,6 +14,8 @@ type taskData struct {
 	BlockSize int
 	// Whether the block was found
 	HaveBlock bool
+	// Whether the block is known, only has effect if HaveBlock = false
+	KnowBlock bool
 }
 
 type taskMerger struct{}
@@ -22,7 +24,7 @@ func newTaskMerger() *taskMerger {
 	return &taskMerger{}
 }
 
-// The request queue uses this Method to decide if a newly pushed task has any
+// HasNewInfo is used by the request queue to decide if a newly pushed task has any
 // new information beyond the tasks with the same Topic (CID) in the queue.
 func (*taskMerger) HasNewInfo(task peertask.Task, existing []*peertask.Task) bool {
 	haveSize := false
@@ -32,7 +34,6 @@ func (*taskMerger) HasNewInfo(task peertask.Task, existing []*peertask.Task) boo
 		if etd.HaveBlock {
 			haveSize = true
 		}
-
 		if etd.IsWantBlock {
 			isWantBlock = true
 		}
@@ -46,15 +47,15 @@ func (*taskMerger) HasNewInfo(task peertask.Task, existing []*peertask.Task) boo
 	}
 
 	// If there is no size information for the CID and the new task has
-	// size information, the new task is better
-	if !haveSize && newTaskData.HaveBlock {
+	// size information or knows something about the block, the new task is better
+	if !haveSize && (newTaskData.HaveBlock || newTaskData.KnowBlock) {
 		return true
 	}
 
 	return false
 }
 
-// The request queue uses Merge to merge a newly pushed task with an existing
+// Merge is used by the request queue to merge a newly pushed task with an existing
 // task with the same Topic (CID)
 func (*taskMerger) Merge(task peertask.Task, existing *peertask.Task) {
 	newTask := task.Data.(*taskData)
@@ -65,6 +66,11 @@ func (*taskMerger) Merge(task peertask.Task, existing *peertask.Task) {
 	if !existingTask.HaveBlock && newTask.HaveBlock {
 		existingTask.HaveBlock = newTask.HaveBlock
 		existingTask.BlockSize = newTask.BlockSize
+
+		// New know information, we must update work size even if existing task already has knows
+	} else if !existingTask.HaveBlock && newTask.KnowBlock {
+		existingTask.KnowBlock = newTask.KnowBlock
+		existing.Work = task.Work
 	}
 
 	// If replacing a want-have with a want-block

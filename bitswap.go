@@ -3,8 +3,8 @@ package bitswap
 import (
 	"context"
 	"fmt"
-
 	"github.com/ipfs/go-bitswap/client"
+	"github.com/ipfs/go-bitswap/client/replication/storage"
 	"github.com/ipfs/go-bitswap/internal/defaults"
 	"github.com/ipfs/go-bitswap/message"
 	"github.com/ipfs/go-bitswap/network"
@@ -47,6 +47,7 @@ type bitswap interface {
 var _ exchange.SessionExchange = (*Bitswap)(nil)
 var _ bitswap = (*Bitswap)(nil)
 var HasBlockBufferSize = defaults.HasBlockBufferSize
+var useReplication = true
 
 type Bitswap struct {
 	*client.Client
@@ -77,21 +78,30 @@ func New(ctx context.Context, net network.BitSwapNetwork, bstore blockstore.Bloc
 		}
 	}
 
-	if bs.tracer != nil {
-		var tracer tracer.Tracer = nopReceiveTracer{bs.tracer}
-		clientOptions = append(clientOptions, client.WithTracer(tracer))
-		serverOptions = append(serverOptions, server.WithTracer(tracer))
-	}
+	// Overwrites every other tracer
+	//TODO: This is not ideal
+	bs.tracer = &tracer.SimpleTracer{}
+	var tc tracer.Tracer = nopReceiveTracer{bs.tracer}
+	clientOptions = append(clientOptions, client.WithTracer(tc))
+	serverOptions = append(serverOptions, server.WithTracer(tc))
 
 	if HasBlockBufferSize != defaults.HasBlockBufferSize {
 		serverOptions = append(serverOptions, server.HasBlockBufferSize(HasBlockBufferSize))
 	}
 
+	var replicationIndex *storage.Index
+	if useReplication {
+		replicationIndex = storage.NewBlockIndex()
+		serverOptions = append(serverOptions, server.WithReplication(replicationIndex))
+	}
+
 	ctx = metrics.CtxSubScope(ctx, "bitswap")
 
 	bs.Server = server.New(ctx, net, bstore, serverOptions...)
-	bs.Client = client.New(ctx, net, bstore, append(clientOptions, client.WithBlockReceivedNotifier(bs.Server))...)
+	bs.Client = client.New(ctx, net, bstore, replicationIndex, append(clientOptions, client.WithBlockReceivedNotifier(bs.Server))...)
 	net.Start(bs) // use the polyfill receiver to log received errors and trace messages only once
+
+	log.Info("Using custom version of bitswap!")
 
 	return bs
 }

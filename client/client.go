@@ -5,7 +5,8 @@ package client
 import (
 	"context"
 	"errors"
-
+	"github.com/ipfs/go-bitswap/client/replication"
+	"github.com/ipfs/go-bitswap/client/replication/storage"
 	"sync"
 	"time"
 
@@ -88,8 +89,12 @@ type BlockReceivedNotifier interface {
 	ReceivedBlocks(peer.ID, []blocks.Block)
 }
 
+// TODO this receives the replicationIndex or nil if there's no replication, there are arguable better ways to do it but
+// 		it works for now; The PeerManager needs to receive the index but it's instantiated before the client
+//		loading the options. Must be fixed, maybe.
+
 // New initializes a Bitswap client that runs until client.Close is called.
-func New(parent context.Context, network bsnet.BitSwapNetwork, bstore blockstore.Blockstore, options ...Option) *Client {
+func New(parent context.Context, network bsnet.BitSwapNetwork, bstore blockstore.Blockstore, replicationIndex *storage.Index, options ...Option) *Client {
 	// important to use provided parent context (since it may include important
 	// loggable data). It's probably not a good idea to allow bitswap to be
 	// coupled to the concerns of the ipfs daemon in this way.
@@ -111,7 +116,7 @@ func New(parent context.Context, network bsnet.BitSwapNetwork, bstore blockstore
 	onDontHaveTimeout := func(p peer.ID, dontHaves []cid.Cid) {
 		// Simulate a message arriving with DONT_HAVEs
 		if bs.simulateDontHavesOnTimeout {
-			sm.ReceiveFrom(ctx, p, nil, nil, dontHaves)
+			sm.ReceiveFrom(ctx, p, nil, nil, dontHaves, nil)
 		}
 	}
 	peerQueueFactory := func(ctx context.Context, p peer.ID) bspm.PeerQueue {
@@ -120,8 +125,14 @@ func New(parent context.Context, network bsnet.BitSwapNetwork, bstore blockstore
 
 	sim := bssim.New()
 	bpm := bsbpm.New()
-	pm := bspm.New(ctx, peerQueueFactory, network.Self())
+	pm := bspm.New(ctx, peerQueueFactory, network.Self(), replicationIndex)
 	pqm := bspqm.New(ctx, network)
+
+	var replicator *replication.Replicator
+	if replicationIndex != nil {
+		replicator = replication.NewReplicator(ctx, bstore, pm, true)
+		//replicator = active.NewPeriodicReplicator(ctx, bstore, pm, true)
+	}
 
 	sessionFactory := func(
 		sessctx context.Context,
@@ -158,6 +169,9 @@ func New(parent context.Context, network bsnet.BitSwapNetwork, bstore blockstore
 		provSearchDelay:            defaults.ProvSearchDelay,
 		rebroadcastDelay:           delay.Fixed(time.Minute),
 		simulateDontHavesOnTimeout: true,
+
+		replicationIndex: replicationIndex,
+		replicator:       replicator,
 	}
 
 	// apply functional options before starting and running bitswap
@@ -227,6 +241,11 @@ type Client struct {
 
 	// whether we should actually simulate dont haves on request timeout
 	simulateDontHavesOnTimeout bool
+
+	// The replication index keeps track of (replication) info shared by peers
+	replicationIndex *storage.Index
+	// The replicator actively replicates info
+	replicator *replication.Replicator
 }
 
 type counters struct {
@@ -279,7 +298,7 @@ func (bs *Client) NotifyNewBlocks(ctx context.Context, blks ...blocks.Block) err
 
 	// Send all block keys (including duplicates) to any sessions that want them.
 	// (The duplicates are needed by sessions for accounting purposes)
-	bs.sm.ReceiveFrom(ctx, "", blkCids, nil, nil)
+	bs.sm.ReceiveFrom(ctx, "", blkCids, nil, nil, nil)
 
 	// Publish the block to any Bitswap clients that had requested blocks.
 	// (the sessions use this pubsub mechanism to inform clients of incoming
@@ -290,7 +309,7 @@ func (bs *Client) NotifyNewBlocks(ctx context.Context, blks ...blocks.Block) err
 }
 
 // receiveBlocksFrom process blocks received from the network
-func (bs *Client) receiveBlocksFrom(ctx context.Context, from peer.ID, blks []blocks.Block, haves []cid.Cid, dontHaves []cid.Cid) error {
+func (bs *Client) receiveBlocksFrom(ctx context.Context, from peer.ID, blks []blocks.Block, haves []cid.Cid, dontHaves []cid.Cid, knows []cid.Cid) error {
 	select {
 	case <-bs.process.Closing():
 		return errors.New("bitswap is closed")
@@ -308,14 +327,15 @@ func (bs *Client) receiveBlocksFrom(ctx context.Context, from peer.ID, blks []bl
 	}
 
 	// Inform the PeerManager so that we can calculate per-peer latency
-	combined := make([]cid.Cid, 0, len(allKs)+len(haves)+len(dontHaves))
+	combined := make([]cid.Cid, 0, len(allKs)+len(haves)+len(dontHaves)+len(knows))
 	combined = append(combined, allKs...)
 	combined = append(combined, haves...)
 	combined = append(combined, dontHaves...)
+	combined = append(combined, knows...)
 	bs.pm.ResponseReceived(from, combined)
 
 	// Send all block keys (including duplicates) to any sessions that want them for accounting purpose.
-	bs.sm.ReceiveFrom(ctx, from, allKs, haves, dontHaves)
+	bs.sm.ReceiveFrom(ctx, from, allKs, haves, dontHaves, knows)
 
 	if bs.blockReceivedNotifier != nil {
 		bs.blockReceivedNotifier.ReceivedBlocks(from, wanted)
@@ -329,7 +349,7 @@ func (bs *Client) receiveBlocksFrom(ctx context.Context, from peer.ID, blks []bl
 	}
 
 	for _, b := range wanted {
-		log.Debugw("Bitswap.GetBlockRequest.End", "cid", b.Cid())
+		log.Infow("Bitswap.GetBlockRequest.End", "cid", b.Cid())
 	}
 
 	return nil
@@ -357,14 +377,53 @@ func (bs *Client) ReceiveMessage(ctx context.Context, p peer.ID, incoming bsmsg.
 
 	haves := incoming.Haves()
 	dontHaves := incoming.DontHaves()
-	if len(iblocks) > 0 || len(haves) > 0 || len(dontHaves) > 0 {
+	knows := incoming.Knows()
+	if len(iblocks) > 0 || len(haves) > 0 || len(dontHaves) > 0 || len(knows) > 0 {
+		// Collect knows and targets (peers that maybe have a block)
+		known := make([]cid.Cid, len(knows))
+		targets := make(map[peer.ID][]cid.Cid)
+		for c, peers := range knows {
+			known = append(known, c)
+			for _, target := range peers {
+				if _, ok := targets[target]; !ok {
+					targets[target] = []cid.Cid{}
+				}
+				targets[target] = append(targets[target], c)
+			}
+		}
+
 		// Process blocks
-		err := bs.receiveBlocksFrom(ctx, p, iblocks, haves, dontHaves)
+		err := bs.receiveBlocksFrom(ctx, p, iblocks, haves, dontHaves, known)
 		if err != nil {
 			log.Warnf("ReceiveMessage recvBlockFrom error: %s", err)
 			return
 		}
+
+		// Open connections to new peers and inform sessions about the (allegedly) haves
+		for target, cids := range targets {
+			go func(p peer.ID, cids []cid.Cid) {
+				if !bs.pm.IsConnected(p) {
+					log.Infow("Opening connection", "peer", p, "want", cids)
+					err = bs.network.ConnectTo(ctx, p)
+					if err != nil {
+						log.Errorf("ReceiveMessage failed to connect to new peer: %s", err)
+						return
+					}
+				} else {
+					log.Infow("Already connected", "peer", p, "want", cids)
+				}
+				bs.sm.ReceiveFrom(ctx, p, nil, cids, nil, nil)
+			}(target, cids)
+		}
 	}
+
+	// Update the index with replication info
+	if bs.replicationIndex != nil {
+		if add, rm := incoming.Info(); len(add) > 0 || len(rm) > 0 {
+			bs.replicationIndex.Update(p, add, rm)
+		}
+	}
+
 }
 
 func (bs *Client) updateReceiveCounters(blocks []blocks.Block) {
@@ -423,13 +482,26 @@ func (bs *Client) blockstoreHas(blks []blocks.Block) []bool {
 // PeerConnected is called by the network interface
 // when a peer initiates a new connection to bitswap.
 func (bs *Client) PeerConnected(p peer.ID) {
+	log.Infow("PeerConnected", "peer", p)
+
 	bs.pm.Connected(p)
+
+	// If use replication
+	if bs.replicationIndex != nil {
+		bs.replicator.PeerConnected(p)
+	}
+
 }
 
 // PeerDisconnected is called by the network interface when a peer
 // closes a connection
 func (bs *Client) PeerDisconnected(p peer.ID) {
 	bs.pm.Disconnected(p)
+
+	// If use replication
+	if bs.replicationIndex != nil {
+		bs.replicationIndex.PeerDisconnected(p)
+	}
 }
 
 // ReceiveError is called by the network interface when an error happens

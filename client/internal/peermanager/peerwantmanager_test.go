@@ -49,6 +49,9 @@ func (mpq *mockPQ) AddCancels(cs []cid.Cid) {
 func (mpq *mockPQ) ResponseReceived(ks []cid.Cid) {
 }
 
+func (mpq *mockPQ) AddInfo(haves, donts []cid.Cid) {
+}
+
 func clearSent(pqs map[peer.ID]PeerQueue) {
 	for _, pqi := range pqs {
 		pqi.(*mockPQ).clear()
