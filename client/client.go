@@ -131,7 +131,6 @@ func New(parent context.Context, network bsnet.BitSwapNetwork, bstore blockstore
 	var replicator *replication.Replicator
 	if replicationIndex != nil {
 		replicator = replication.NewReplicator(ctx, bstore, pm, true)
-		//replicator = active.NewPeriodicReplicator(ctx, bstore, pm, true)
 	}
 
 	sessionFactory := func(
@@ -153,6 +152,7 @@ func New(parent context.Context, network bsnet.BitSwapNetwork, bstore blockstore
 	}
 	notif := notifications.New()
 	sm = bssm.New(ctx, sessionFactory, sim, sessionPeerManagerFactory, bpm, pm, notif, network.Self())
+	connector := replication.NewConnector(sm, network)
 
 	bs = &Client{
 		blockstore:                 bstore,
@@ -172,6 +172,7 @@ func New(parent context.Context, network bsnet.BitSwapNetwork, bstore blockstore
 
 		replicationIndex: replicationIndex,
 		replicator:       replicator,
+		connector:        connector,
 	}
 
 	// apply functional options before starting and running bitswap
@@ -246,6 +247,9 @@ type Client struct {
 	replicationIndex *storage.Index
 	// The replicator actively replicates info
 	replicator *replication.Replicator
+	// Connector ensures that the network is not bombarded with requests for new connections
+	// upon receiving a series of requests from the KNOW responses
+	connector *replication.Connector
 }
 
 type counters struct {
@@ -379,6 +383,7 @@ func (bs *Client) ReceiveMessage(ctx context.Context, p peer.ID, incoming bsmsg.
 	dontHaves := incoming.DontHaves()
 	knows := incoming.Knows()
 	if len(iblocks) > 0 || len(haves) > 0 || len(dontHaves) > 0 || len(knows) > 0 {
+
 		// Collect knows and targets (peers that maybe have a block)
 		known := make([]cid.Cid, len(knows))
 		targets := make(map[peer.ID][]cid.Cid)
@@ -401,19 +406,12 @@ func (bs *Client) ReceiveMessage(ctx context.Context, p peer.ID, incoming bsmsg.
 
 		// Open connections to new peers and inform sessions about the (allegedly) haves
 		for target, cids := range targets {
-			go func(p peer.ID, cids []cid.Cid) {
-				if !bs.pm.IsConnected(p) {
-					log.Infow("Opening connection", "peer", p, "want", cids)
-					err = bs.network.ConnectTo(ctx, p)
-					if err != nil {
-						log.Errorf("ReceiveMessage failed to connect to new peer: %s", err)
-						return
-					}
-				} else {
-					log.Infow("Already connected", "peer", p, "want", cids)
-				}
-				bs.sm.ReceiveFrom(ctx, p, nil, cids, nil, nil)
-			}(target, cids)
+			if !bs.pm.IsConnected(target) {
+				bs.connector.ConnectFor(ctx, target, cids)
+			} else { // TODO once a peer connects multiple peers may send KNOWS which will cause a storm of "fake" haves, fix it
+				log.Infow("After KNOW - already connected", "peer", target)
+				bs.sm.ReceiveFrom(ctx, target, nil, cids, nil, nil)
+			}
 		}
 	}
 
@@ -482,8 +480,6 @@ func (bs *Client) blockstoreHas(blks []blocks.Block) []bool {
 // PeerConnected is called by the network interface
 // when a peer initiates a new connection to bitswap.
 func (bs *Client) PeerConnected(p peer.ID) {
-	log.Infow("PeerConnected", "peer", p)
-
 	bs.pm.Connected(p)
 
 	// If use replication

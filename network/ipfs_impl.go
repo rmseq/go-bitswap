@@ -383,6 +383,7 @@ func (bsnet *impl) FindProvidersAsync(ctx context.Context, k cid.Cid, max int) <
 			if info.ID == bsnet.host.ID() {
 				continue // ignore self as provider
 			}
+			log.Infow("FindProviderAsync", "found_peer", info.ID)
 			bsnet.host.Peerstore().AddAddrs(info.ID, info.Addrs, peerstore.TempAddrTTL)
 			select {
 			case <-ctx.Done():

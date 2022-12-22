@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	defaultPeriod = 10
+	defaultPeriod = 30
 )
 
 var logger = log.Logger("replicator")

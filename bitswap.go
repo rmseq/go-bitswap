@@ -168,11 +168,13 @@ func (bs *Bitswap) WantlistForPeer(p peer.ID) []cid.Cid {
 func (bs *Bitswap) PeerConnected(p peer.ID) {
 	bs.Client.PeerConnected(p)
 	bs.Server.PeerConnected(p)
+	log.Infow("PeerConnected", "peer", p)
 }
 
 func (bs *Bitswap) PeerDisconnected(p peer.ID) {
 	bs.Client.PeerDisconnected(p)
 	bs.Server.PeerDisconnected(p)
+	log.Infow("PeerDisconnected", "peer", p)
 }
 
 func (bs *Bitswap) ReceiveError(err error) {
